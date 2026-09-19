@@ -1,0 +1,41 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sa3jax"
+version = "0.1.0"
+description = "Pure-functional JAX port of Stable Audio 3 inference"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+keywords = ["jax", "stable-audio", "text-to-audio", "diffusion", "inference", "tpu"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Sound/Audio :: Analysis",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+# `jax` is not pinned: install the build matching your accelerator (CPU, CUDA, TPU).
+# The extras below are the CUDA build; TPU hosts use `jax[tpu]` instead.
+dependencies = [
+    "jax>=0.4.34",
+    "numpy>=1.26",
+    "safetensors>=0.4",
+    "tokenizers>=0.20",
+]
+
+[project.optional-dependencies]
+cuda = ["jax[cuda12]>=0.4.34"]
+tpu = ["jax[tpu]>=0.4.34"]
+
+[project.urls]
+Homepage = "https://github.com/kelechi-c/hummingbird"
+
+[tool.hatch.build.targets.wheel]
+packages = ["sa3jax"]
