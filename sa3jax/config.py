@@ -51,6 +51,10 @@ class DiTConfig:
     qk_norm_eps: float = 1e-6
     rope_theta: float = 10000.0
     fourier_dim: int = 256
+    # Self-attention implementation: the XLA `_sdpa` chain (any backend) or, on TPU, the fused Pallas
+    # kernel (`dense_attention`: norm -> RoPE -> V-mask -> both differential softmaxes -> subtract in
+    # one VMEM pass; scores kept fp32 where XLA rounds them to bf16). "fused" falls back off TPU.
+    attention: Literal["xla", "fused"] = "xla"
 
     @property
     def head_dim(self) -> int:

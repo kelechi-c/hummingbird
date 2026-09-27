@@ -16,18 +16,19 @@ a flag: `medium` sets it and retrofitting it would be an attention rewrite, not 
 from __future__ import annotations
 
 import math
+from functools import partial
 from typing import Any
 
 import jax
 import jax.numpy as jnp
 from jax import Array
 
+from sa3jax import dense_attention
 from sa3jax.config import DiTConfig
 from sa3jax.dtypes import Dtype
 
 Params = dict[str, Any]
 Static = dict[str, Array]
-
 
 def _linear(x: Array, weight: Array, bias: Array | None = None) -> Array:
     """`nn.Linear`; the checkpoint stores `[out, in]`."""
@@ -118,6 +119,34 @@ def _sdpa(q: Array, k: Array, v: Array, cfg: DiTConfig) -> Array:
     return jnp.einsum("bhst,bhtd->bhsd", weights, v)
 
 
+def _k_norm(attn: Params, k: Array, k_diff: Array | None, cfg: DiTConfig, dtype: Dtype) -> tuple[Array, Array | None]:
+    """`k`'s RMSNorm (and its differential pair), shared by self- and cross-attention. `_attend`
+    only norms `q`, because cross-attention's k is hoisted into `static` already normalised."""
+    k = _rms(k, attn["k_norm"]["weight"], cfg.qk_norm_eps, dtype)
+    if k_diff is not None:
+        k_diff = _rms(k_diff, attn["k_norm"]["weight"], cfg.qk_norm_eps, dtype)
+    return k, k_diff
+
+
+def _attend_out(
+    attn: Params,
+    q: Array,
+    k: Array,
+    v: Array,
+    q_diff: Array | None,
+    k_diff: Array | None,
+    cfg: DiTConfig,
+) -> Array:
+    """SDPA -> `to_out` (with the differential subtraction) for already normed/roped q/k/v.
+
+    `out = SDPA(q, k, v) - SDPA(q_diff, k_diff, v)` with a shared `v` when `differential`.
+    """
+    out = _sdpa(q, k, v, cfg)
+    if q_diff is not None:
+        out = out - _sdpa(q_diff, k_diff, v, cfg)
+    return _linear(_merge(out), attn["to_out"]["weight"])
+
+
 def _attend(
     attn: Params,
     q: Array,
@@ -131,51 +160,53 @@ def _attend(
     dtype: Dtype,
 ) -> Array:
     """
-    q/k RMSNorm -> RoPE -> SDPA -> `to_out`. `q_diff`/`k_diff` are `None` unless `differential`
-    (`medium`), in which case `out = SDPA(q, k, v) - SDPA(q_diff, k_diff, v)` with a shared `v`.
+    q RMSNorm -> RoPE -> SDPA -> `to_out`. `k`/`k_diff` arrive already k-normed: self-attention
+    norms them inline, cross-attention hoists them into `static`. `q_diff`/`k_diff` are `None`
+    unless `differential` (`medium`), in which case the two SDPAs share `v` and are subtracted.
     """
     q = _rms(q, attn["q_norm"]["weight"], cfg.qk_norm_eps, dtype)
-    k = _rms(k, attn["k_norm"]["weight"], cfg.qk_norm_eps, dtype)
     if q_diff is not None:
         q_diff = _rms(q_diff, attn["q_norm"]["weight"], cfg.qk_norm_eps, dtype)
-        k_diff = _rms(k_diff, attn["k_norm"]["weight"], cfg.qk_norm_eps, dtype)
     if rope is not None:
         q, k = _rope(q, *rope, dtype), _rope(k, *rope, dtype)
         if q_diff is not None:
             q_diff, k_diff = _rope(q_diff, *rope, dtype), _rope(k_diff, *rope, dtype)
     if mask is not None:
         v = v * mask
-    out = _sdpa(q, k, v, cfg)
-    if q_diff is not None:
-        out = out - _sdpa(q_diff, k_diff, v, cfg)
-    return _linear(_merge(out), attn["to_out"]["weight"])
+    return _attend_out(attn, q, k, v, q_diff, k_diff, cfg)
 
 
-def _self_attention(
-    h: Array, block: Params, rope: tuple[Array, Array], mask: Array, cfg: DiTConfig, dtype: Dtype
-) -> Array:
-    """Fused `to_qkv` self-attention, with RoPE and the extended padding mask."""
+def _self_attention(h: Array, block: Params, static: Static, cfg: DiTConfig, dtype: Dtype) -> Array:
+    """Fused `to_qkv` self-attention: the XLA split/norm/RoPE/SDPA chain, or on TPU the fused Pallas
+    kernel (`cfg.attention == "fused"`, `dense_attention`), which does norm -> RoPE -> V-mask ->
+    both differential softmaxes -> subtract in one VMEM pass and writes the merged layout."""
     attn = block["self_attn"]
-    parts = jnp.split(_linear(h, attn["to_qkv"]["weight"]), 5 if cfg.differential else 3, axis=-1)
+    qkv = _linear(h, attn["to_qkv"]["weight"])
+    if cfg.attention == "fused" and cfg.differential and jax.default_backend() == "tpu":
+        out = dense_attention.dense_attention(qkv, attn["q_norm"]["weight"], attn["k_norm"]["weight"],
+                                              static["lane_cos"], static["lane_sin"], static["lane_mask"],
+                                              cfg.num_heads, cfg.head_dim, cfg.rope_dim // 2, cfg.qk_norm_eps)
+        return _linear(out, attn["to_out"]["weight"])
+    parts = jnp.split(qkv, 5 if cfg.differential else 3, axis=-1)
     q, k, v = (_heads(t, cfg) for t in parts[:3])
     q_diff, k_diff = (_heads(t, cfg) for t in parts[3:]) if cfg.differential else (None, None)
-    return _attend(attn, q, k, v, q_diff, k_diff, rope, mask, cfg, dtype)
+    k, k_diff = _k_norm(attn, k, k_diff, cfg, dtype)
+    return _attend(attn, q, k, v, q_diff, k_diff, (static["cos"], static["sin"]), static["v_mask"], cfg, dtype)
 
 
-def _cross_attention(h: Array, ctx: Array, block: Params, cfg: DiTConfig, dtype: Dtype) -> Array:
-    """`to_q` + `to_kv` cross-attention. No RoPE and no mask (`dit.py:1033-1035`): the reference
-    only forwards `cross_attn_rotary_pos_emb` when it exists, and it is `None` here."""
+def _cross_attention(h: Array, static: Static, block: Params, index: int, cfg: DiTConfig, dtype: Dtype) -> Array:
+    """`to_q` plus the hoisted `to_kv` K/V. No RoPE and no mask (`dit.py:1033-1035`): the
+    reference only forwards `cross_attn_rotary_pos_emb` when it exists, and it is `None` here."""
     attn = block["cross_attn"]
     q = _linear(h, attn["to_q"]["weight"])
-    kv = _linear(ctx, attn["to_kv"]["weight"])
     if cfg.differential:
         q, q_diff = (_heads(t, cfg) for t in jnp.split(q, 2, axis=-1))
-        k, k_diff, v = (_heads(t, cfg) for t in jnp.split(kv, 3, axis=-1))
+        k_diff = static["cross_k_diff"][index]
     else:
-        q = _heads(q, cfg)
-        k, v = (_heads(t, cfg) for t in jnp.split(kv, 2, axis=-1))
-        q_diff = k_diff = None
-    return _attend(attn, q, k, v, q_diff, k_diff, None, None, cfg, dtype)
+        q, q_diff, k_diff = _heads(q, cfg), None, None
+    return _attend(
+        attn, q, static["cross_k"][index], static["cross_v"][index], q_diff, k_diff, None, None, cfg, dtype
+    )
 
 
 def _feed_forward(x: Array, ff: Params) -> Array:
@@ -193,16 +224,14 @@ def _block(h: Array, block: Params, static: Static, gcond: Array, index: int, cf
     scale_self, shift_self, gate_self, scale_ff, shift_ff, gate_ff = jnp.split(
         (block["to_scale_shift_gate"].astype(dtype.compute) + gcond)[:, None, :], 6, axis=-1
     )
-    rope = (static["cos"], static["sin"])
-
     residual = h
     x = _rms(h, block["pre_norm"]["weight"], cfg.norm_eps, dtype)
     x = x * (1 + scale_self) + shift_self
-    x = _self_attention(x, block, rope, static["v_mask"], cfg, dtype)
+    x = _self_attention(x, block, static, cfg, dtype)
     h = residual + x * jax.nn.sigmoid(1 - gate_self)
 
     x = _rms(h, block["cross_attend_norm"]["weight"], cfg.norm_eps, dtype)
-    h = h + _cross_attention(x, static["ctx"], block, cfg, dtype)
+    h = h + _cross_attention(x, static, block, index, cfg, dtype)
 
     # `_apply_local_conditioning` left-pads `(1, T, 1024)` to `64 + T` at the add site
     # (`transformer.py:982`), so the memory tokens receive nothing. See `_local_constants`.
@@ -236,35 +265,70 @@ def _local_constants(blocks: tuple[Params, ...], dtype: Dtype) -> Array:
     )
 
 
+def _cross_kv(block: Params, ctx: Array, cfg: DiTConfig, dtype: Dtype) -> tuple[Array, ...]:
+    """One block's cross-attention K/V: `to_kv` -> split -> heads -> `k_norm`, hoisted out of the
+    sampler loop (`ctx` is constant, so this whole chain ran 24 x 8 times needlessly). Returns
+    `(k, k_diff, v)` when `differential`, `(k, v)` otherwise; `v` is never normed."""
+    attn = block["cross_attn"]
+    kv = _linear(ctx, attn["to_kv"]["weight"])
+    if cfg.differential:
+        k, k_diff, v = (_heads(t, cfg) for t in jnp.split(kv, 3, axis=-1))
+        return (*_k_norm(attn, k, k_diff, cfg, dtype), v)
+    k, v = (_heads(t, cfg) for t in jnp.split(kv, 2, axis=-1))
+    return _k_norm(attn, k, None, cfg, dtype)[0], v
+
+
 def prepare_static(params: Params, cond: Params, padding_mask: Array, cfg: DiTConfig, dtype: Dtype) -> Static:
     """Everything `dit_forward` needs that does not depend on `x` or `t`.
 
     `cond` is `sa3jax.conditioner.assemble_conditioning`'s dict: `cross_attn_cond` `(B, 257, 768)`
     and `global_cond` `(B, 768)`. `cross_attn_mask` is discarded by the reference
-    (`dit.py:411-414`) and `local_add_cond` is ignored because it is identically zero here.
-    Per-block cross-attention K/V hoisting is deferred to M8; it changes the block signature.
+    (`dit.py:411-414`) and `local_add_cond` is ignored because it is identically zero here — the one
+    check that needs a concrete value, so it stays eager; everything else is `_static`, one jit.
     """
-    net = params["transformer"]
-    batch, seq_len = padding_mask.shape
-    memory = cfg.num_memory_tokens
     local = cond.get("local_add_cond")
     if local is not None and float(jnp.max(jnp.abs(local))) != 0.0:
         raise ValueError(
             "local_add_cond is non-zero (inpaint): the constant `to_local_embed` shortcut holds "
             "only for an all-zero input. Implement the full per-position path before enabling it"
         )
+    return _static(params, cond["cross_attn_cond"], cond["global_cond"], padding_mask, cfg, dtype)
+
+
+@partial(jax.jit, static_argnums=(4, 5))
+def _static(params: Params, cross_cond: Array, global_cond: Array, padding_mask: Array, cfg: DiTConfig,
+            dtype: Dtype) -> Static:
+    """`prepare_static`'s body as one executable. Eager, the hoisted cross K/V below was ~100 separate
+    dispatches per clip (24 blocks x project/split/transpose/norm) and cost more than it saved.
+
+    Per-block cross-attention K/V is hoisted here, already k-normed, as a stacked `(depth, ...)`
+    pytree of arrays the sampler reuses every step. Under `attention == "fused"` it also carries the
+    kernel's lane RoPE tables and lane V-mask, built once per clip instead of once per block per step.
+    """
+    net = params["transformer"]
+    batch, seq_len = padding_mask.shape
+    memory = cfg.num_memory_tokens
     cos, sin = _rope_tables(memory + seq_len, net["rope_inv_freq"])
     # The mask is extended True over the 64 memory tokens (`transformer.py:1213-1225`) and cast to
     # the compute dtype: it multiplies V, it is not an additive attention mask.
     valid = jnp.concatenate([jnp.ones((batch, memory), dtype=bool), padding_mask.astype(bool)], axis=-1)
-    return {
-        "ctx": _sequential(params["to_cond_embed"], cond["cross_attn_cond"].astype(dtype.compute)),
-        "gcond_proj": _sequential(params["to_global_embed"], cond["global_cond"].astype(dtype.compute)),
+    ctx = _sequential(params["to_cond_embed"], cross_cond.astype(dtype.compute))
+    kv = [_cross_kv(block, ctx, cfg, dtype) for block in net["blocks"]]
+    static: Static = {
+        "gcond_proj": _sequential(params["to_global_embed"], global_cond.astype(dtype.compute)),
         "local": _local_constants(net["blocks"], dtype),
         "cos": cos,
         "sin": sin,
         "v_mask": valid.astype(dtype.compute)[:, None, :, None],
+        "cross_k": jnp.stack([t[0] for t in kv]),
+        "cross_v": jnp.stack([t[-1] for t in kv]),
     }
+    if cfg.differential:
+        static["cross_k_diff"] = jnp.stack([t[1] for t in kv])
+    if cfg.attention == "fused":
+        static["lane_cos"], static["lane_sin"], static["lane_mask"] = dense_attention.tables(
+            memory + seq_len, net["rope_inv_freq"], valid, cfg.head_dim, dtype.compute)
+    return static
 
 
 def dit_forward(params: Params, x: Array, t: Array, static: Static, cfg: DiTConfig, dtype: Dtype) -> Array:
