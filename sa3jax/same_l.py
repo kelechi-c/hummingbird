@@ -55,12 +55,17 @@ def _linear(x: Array, weight: Array, bias: Array | None = None) -> Array:
 
 
 def _dyt(x: Array, norm: Params) -> Array:
-    """`DynamicTanh`: `gamma * tanh(alpha * x) + beta`, `alpha` a scalar.
+    """`DynamicTanh`: `gamma * tanh(alpha * x) + beta`, `alpha` a scalar (`transformer.py:325-334`).
 
-    Elementwise, so it stays in the compute dtype: unlike the DiT's RMSNorm there is no reduction
-    to overflow and therefore no fp32 island (`transformer.py:325-334`).
+    An fp32 island, returned in fp32. There is no reduction to overflow; the loss is rounding: bf16
+    rounds four times here, the trained gammas are large (logits reach absmax 2269) and the band
+    softmax is near-argmax, so each rounding flips winners. Measured on trained medium weights: bf16
+    DyT alone costs the decode 16.7 dB SNR vs 36.3 dB at fp32 (MERT-v2 0.960 vs 0.9987), for +7 %
+    decode time. Callers cast back to the compute dtype before the next GEMM, or fp32 promotion
+    would silently turn every following matmul fp32; q/k stay fp32 through RoPE into `QK^T`.
     """
-    return norm["gamma"] * jnp.tanh(norm["alpha"] * x) + norm["beta"]
+    f32 = jnp.float32
+    return norm["gamma"].astype(f32) * jnp.tanh(norm["alpha"].astype(f32) * x.astype(f32)) + norm["beta"].astype(f32)
 
 
 def _heads(x: Array, cfg: SameConfig) -> Array:
@@ -177,8 +182,8 @@ def _block(x: Array, block: Params, index: int, mask: Array, cfg: SameConfig, dt
     """`TransformerBlock.forward`'s non-adaLN branch (`transformer.py:1051-1065`). No cross-attn, no
     conformer, no local conditioning, and `layer_scale` is off so `self_attn_scale`/`ff_scale` are
     `Identity` and drop out of the two residual adds."""
-    h = x + _attention(_dyt(x, block["pre_norm"]), block, mask, cfg, dtype)
-    return h + _feed_forward(_dyt(h, block["ff_norm"]), block, index, cfg)
+    h = x + _attention(_dyt(x, block["pre_norm"]).astype(dtype.compute), block, mask, cfg, dtype)
+    return h + _feed_forward(_dyt(h, block["ff_norm"]).astype(dtype.compute), block, index, cfg)
 
 
 def _patch(x: Array, cfg: SameConfig) -> Array:
