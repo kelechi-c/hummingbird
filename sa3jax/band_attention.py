@@ -59,70 +59,83 @@ def rope_tables(length: int, inv_freq: Array, head_dim: int) -> tuple[Array, Arr
 
 
 def _body(norms, cos_p, sin_p, cos_c, sin_c, cos_n, sin_n, q, qd,
-          k_p, k_c, k_n, v_p, v_c, v_n, kd_p, kd_c, kd_n, out, *, rows, length, window, head_dim, half, compute):
-    """One `(rows, 128)` output tile: row block `i`, head pair `h`, both differential branches."""
+          k_p, k_c, k_n, v_p, v_c, v_n, kd_p, kd_c, kd_n, out, *, rows, halo, sub, length, window, head_dim,
+          half, compute):
+    """One `(rows, 128)` output tile: row block `i`, head pair `h`, both differential branches.
+
+    Keys are the contiguous `rows + 2 * halo` positions `i * rows - halo + r`: a halo before, the
+    block, a halo after. Queries go in `sub`-row slices, each against the `sub + 2 * halo` keys that
+    can reach it, so no query multiplies keys outside its band neighbourhood.
+    """
     from jax.experimental import pallas as pl
     from jax.experimental.pallas import tpu as pltpu
 
-    f32 = jnp.float32
+    f32, bf16 = jnp.float32, jnp.bfloat16
     i = pl.program_id(1)
     lane = lax.broadcasted_iota(jnp.int32, (1, LANES), 1)
     head_a = lane < head_dim
     rot_low = lane % head_dim < half  # dims [0, half) pair with d + half; [half, 2 half) with d - half
+    span = sub + 2 * halo
+    scale = 1.0 / head_dim ** 0.5
+    nt = (((1,), (1,)), ((), ()))  # contract the lane dim of both: q @ k^T
 
-    def dyt(x, alpha, gamma, beta):
-        return gamma * jnp.tanh(alpha * x[0].astype(f32)) + beta
-
-    def rope(x, cos, sin):
+    def prep(ref, norm, cos, sin, factor=1.0):
+        x = norm[1] * jnp.tanh(norm[0] * ref[0].astype(f32)) + norm[2]  # DyT, fp32
         partner = jnp.where(rot_low, pltpu.roll(x, LANES - half, 1), pltpu.roll(x, half, 1))
-        return x * cos[...] + partner * sin[...]
+        return ((x * cos[...] + partner * sin[...]) * factor).astype(bf16)  # RoPE, fp32, then bf16 for the MXU
 
     q_norm = (norms[0:1, :], norms[1:2, :], norms[2:3, :])
     k_norm = (norms[3:4, :], norms[4:5, :], norms[5:6, :])
     tables = ((cos_p, sin_p), (cos_c, sin_c), (cos_n, sin_n))
-    q_pos = i * rows + lax.broadcasted_iota(jnp.int32, (rows, 1), 0)
-    k_pos = [(i + j - 1) * rows + lax.broadcasted_iota(jnp.int32, (1, rows), 1) for j in range(3)]
-    band = [(jnp.abs(p - q_pos) <= window) & (p >= 0) & (p < length) for p in k_pos]
-    nt = (((1,), (1,)), ((), ()))  # contract the lane dim of both: q @ k^T
+    k_start = i * rows - halo
+    k_row = k_start + lax.broadcasted_iota(jnp.int32, (rows + 2 * halo, 1), 0)
+    # rows past the end (ragged last block) or before the start are undefined on read: zero v there,
+    # because a masked weight of 0 times a NaN would still be NaN
+    v = jnp.where((k_row >= 0) & (k_row < length), jnp.concatenate([r[0] for r in (v_p, v_c, v_n)]), 0).astype(bf16)
 
     def branch(q_ref, k_refs):
-        qf = rope(dyt(q_ref, *q_norm), cos_c, sin_c).astype(jnp.bfloat16)
-        ks = [rope(dyt(ref, *k_norm), *tables[j]).astype(jnp.bfloat16) for j, ref in enumerate(k_refs)]
-        vs = [ref[0] for ref in (v_p, v_c, v_n)]
-        heads = []
-        for lanes in (head_a, ~head_a):
-            qh = jnp.where(lanes, qf, jnp.zeros_like(qf))
-            logits = [jnp.where(band[j], lax.dot_general(qh, ks[j], nt, preferred_element_type=f32)
-                                * (1.0 / head_dim ** 0.5), _NEG) for j in range(3)]
-            peak = jnp.maximum(jnp.maximum(logits[0].max(-1, keepdims=True), logits[1].max(-1, keepdims=True)),
-                               logits[2].max(-1, keepdims=True))
-            weights = [jnp.exp(s - peak) for s in logits]
-            total = weights[0].sum(-1, keepdims=True) + weights[1].sum(-1, keepdims=True) + weights[2].sum(-1, keepdims=True)
-            heads.append(sum(jnp.dot((w / total).astype(jnp.bfloat16), vs[j].astype(jnp.bfloat16),
-                                     preferred_element_type=f32) for j, w in enumerate(weights)))
-        return jnp.where(head_a, heads[0], heads[1])
+        qf = prep(q_ref, q_norm, cos_c, sin_c, scale)  # 1/sqrt(64) = 2^-3 folded into q: exact in bf16
+        kf = jnp.concatenate([prep(ref, k_norm, *tables[j]) for j, ref in enumerate(k_refs)])
+        slices = []
+        for s in range(rows // sub):
+            q_pos = i * rows + s * sub + lax.broadcasted_iota(jnp.int32, (sub, 1), 0)
+            k_pos = k_start + s * sub + lax.broadcasted_iota(jnp.int32, (1, span), 1)
+            band = (jnp.abs(k_pos - q_pos) <= window) & (k_pos >= 0) & (k_pos < length)
+            qs, ks, vs = qf[s * sub:(s + 1) * sub], kf[s * sub:s * sub + span], v[s * sub:s * sub + span]
+            heads = []
+            for lanes in (head_a, ~head_a):
+                logits = lax.dot_general(jnp.where(lanes, qs, jnp.zeros_like(qs)), ks, nt, preferred_element_type=f32)
+                logits = jnp.where(band, logits, _NEG)  # the max must see only in-band (and finite) scores
+                weights = jnp.exp(logits - logits.max(-1, keepdims=True))
+                # normalise after P @ V: the division runs on (sub, 128), not on (sub, span)
+                total = weights.sum(-1, keepdims=True)
+                heads.append(jnp.dot(weights.astype(bf16), vs, preferred_element_type=f32) / total)
+            slices.append(jnp.where(head_a, heads[0], heads[1]))
+        return jnp.concatenate(slices)
 
     out[0] = (branch(q, (k_p, k_c, k_n)) - branch(qd, (kd_p, kd_c, kd_n))).astype(compute)
 
 
 def band_attention(qkv: Array, q_norm: dict[str, Array], k_norm: dict[str, Array], inv_freq: Array,
-                   num_heads: int, head_dim: int, window: int, *, rows: int = 256,
-                   interpret: bool = False) -> Array:
+                   num_heads: int, head_dim: int, window: int, *, rows: int = 256, halo: int = 32,
+                   sub: int = 128, interpret: bool = False) -> Array:
     """`(B, S, 5 * H * D)` projection output -> `(B, S, H * D)` differential band attention.
 
     `q_norm`/`k_norm` are the block's DyT params (`alpha` scalar, `gamma`/`beta` `(D,)`), shared by
-    both differential branches as in `same_l._attention`. `rows` is the row tile (a multiple of 8
-    and at least `window`; 256 measured fastest on v6e-1 at 120 s: 64/128/256/512 -> 153/109/88/98 ms); `S` is zero-padded to a multiple of it and the pad rows are masked.
+    both differential branches as in `same_l._attention`. `rows` is the row tile; `halo` (>= window,
+    a multiple of 8 dividing `rows`) the neighbour rows each side; `sub` the query slice (dividing
+    `rows`). `S` need not divide `rows`: the grid is ragged and out-of-range rows are masked/dropped.
     """
     import jax.experimental.pallas as pl
 
-    if head_dim * 2 != LANES or rows % 8 or rows < window:
-        raise ValueError(f"band_attention needs head_dim 64, rows % 8 == 0 and rows >= window: {head_dim}, {rows}")
-    batch, length, width = qkv.shape
+    if head_dim * 2 != LANES or halo < window or halo % 8 or rows % halo or rows % sub or sub % 8:
+        raise ValueError(f"band_attention: need head_dim 64, halo >= window, 8 | halo | rows, 8 | sub | rows "
+                         f"(head_dim={head_dim}, rows={rows}, halo={halo}, sub={sub}, window={window})")
+    batch, length, _ = qkv.shape
     pairs = num_heads * head_dim // LANES
     blocks = -(-length // rows)
-    padded = jnp.pad(qkv, ((0, 0), (0, blocks * rows - length), (0, 0)))
-    cos, sin = rope_tables(blocks * rows, inv_freq, head_dim)
+    per = rows // halo
+    cos, sin = rope_tables((blocks + 1) * rows, inv_freq, head_dim)  # one spare block: every halo index exists
 
     def lanes(value: Array) -> Array:
         return jnp.broadcast_to(jnp.tile(jnp.ravel(value).astype(jnp.float32), LANES // jnp.size(value)), (1, LANES))
@@ -130,29 +143,31 @@ def band_attention(qkv: Array, q_norm: dict[str, Array], k_norm: dict[str, Array
     norms = jnp.concatenate([lanes(q_norm["alpha"]), lanes(q_norm["gamma"]), lanes(q_norm["beta"]),
                              lanes(k_norm["alpha"]), lanes(k_norm["gamma"]), lanes(k_norm["beta"]),
                              jnp.zeros((2, LANES), jnp.float32)])
-    last = blocks - 1
-    shifts = (lambda i: jnp.maximum(i - 1, 0), lambda i: i, lambda i: jnp.minimum(i + 1, last))
+    last_halo = -(-length // halo) - 1
 
-    def section(offset: int, shift=shifts[1]) -> "pl.BlockSpec":
-        return pl.BlockSpec((1, rows, LANES), lambda b, i, h: (b, shift(i), offset * pairs + h))
+    def column(offset: int, size: int, index) -> "pl.BlockSpec":
+        return pl.BlockSpec((1, size, LANES), lambda b, i, h: (b, index(i), offset * pairs + h))
 
-    def table(shift) -> "pl.BlockSpec":
-        return pl.BlockSpec((rows, LANES), lambda b, i, h: (shift(i), 0))
+    def keys(offset: int) -> list["pl.BlockSpec"]:
+        """The halo before, the block, the halo after (halo indices in units of `halo` rows)."""
+        return [column(offset, halo, lambda i: jnp.maximum(i * per - 1, 0)), column(offset, rows, lambda i: i),
+                column(offset, halo, lambda i: jnp.minimum((i + 1) * per, last_halo))]
 
+    tables = [pl.BlockSpec((halo, LANES), lambda b, i, h: (jnp.maximum(i * per - 1, 0), 0)),
+              pl.BlockSpec((rows, LANES), lambda b, i, h: (i, 0)),
+              pl.BlockSpec((halo, LANES), lambda b, i, h: ((i + 1) * per, 0))]
     in_specs = [pl.BlockSpec((8, LANES), lambda b, i, h: (0, 0))]
-    in_specs += [spec for shift in shifts for spec in (table(shift), table(shift))]
-    in_specs += [section(0), section(3)]
-    in_specs += [section(offset, shift) for offset in (1, 2, 4) for shift in shifts]
+    in_specs += [spec for spec in tables for _ in range(2)]
+    in_specs += [column(0, rows, lambda i: i), column(3, rows, lambda i: i)]
+    in_specs += [spec for offset in (1, 2, 4) for spec in keys(offset)]
     kernel = pl.pallas_call(
-        partial(_body, rows=rows, length=length, window=window, head_dim=head_dim,
+        partial(_body, rows=rows, halo=halo, sub=sub, length=length, window=window, head_dim=head_dim,
                 half=inv_freq.shape[0], compute=qkv.dtype),
-        out_shape=jax.ShapeDtypeStruct((batch, blocks * rows, pairs * LANES), qkv.dtype),
+        out_shape=jax.ShapeDtypeStruct((batch, length, pairs * LANES), qkv.dtype),
         grid=(batch, blocks, pairs),
         in_specs=in_specs,
         out_specs=pl.BlockSpec((1, rows, LANES), lambda b, i, h: (b, i, h)),
         interpret=interpret,
         name="same_l_band_attention",
     )
-    tables = [t for _ in shifts for t in (cos, sin)]
-    sections = [padded] * 11
-    return kernel(norms, *tables, *sections)[:, :length]
+    return kernel(norms, cos, sin, cos, sin, cos, sin, *[qkv] * 11)
