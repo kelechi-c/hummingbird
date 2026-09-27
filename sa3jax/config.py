@@ -7,6 +7,7 @@ runtime-tunable: a different checkpoint means a different preset, not a mutated 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 
 @dataclass(frozen=True)
@@ -100,6 +101,10 @@ class SameConfig:
     sinusoidal_blocks: int = 0
     mask_noise: float = 0.01
     mapping_bias: bool = True
+    # SAME-L attention implementation: the XLA band (`same_l._sdpa`, any backend) or the fused Pallas
+    # TPU kernel (`band_attention`, one HBM pass instead of ~150 ms of window/rope/transpose traffic).
+    # "pallas" falls back to XLA off TPU. Needs libtpu matching jax (0.0.23 for jax 0.7.2).
+    attention: Literal["xla", "pallas"] = "xla"
 
     @property
     def dim(self) -> int:
@@ -165,6 +170,7 @@ MEDIUM = ModelConfig(
         mask_noise=0.1,
         conv_mapping=False,
         chunk_midpoint_shift=False,
+        attention="pallas",  # E1: fused band attention on TPU (gate A pass, 2.58x decode); XLA elsewhere
     ),
     audio=AudioConfig(sample_size=16777216),
 )

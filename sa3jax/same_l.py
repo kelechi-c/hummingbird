@@ -39,6 +39,7 @@ import jax
 import jax.numpy as jnp
 from jax import Array
 
+from sa3jax.band_attention import band_attention
 from sa3jax.config import SameConfig
 from sa3jax.dtypes import Dtype
 
@@ -153,7 +154,12 @@ def _attention(x: Array, block: Params, mask: Array, cfg: SameConfig, dtype: Dty
     differential halves reuse the same `q_norm`/`k_norm` (`apply_qk_layernorm` runs on the stacked
     pair)."""
     attn = block["self_attn"]
-    q, k, v, q_diff, k_diff = (_heads(t, cfg) for t in jnp.split(_linear(x, attn["to_qkv"]["weight"]), 5, axis=-1))
+    qkv = _linear(x, attn["to_qkv"]["weight"])
+    if cfg.attention == "pallas" and jax.default_backend() == "tpu":  # a Mosaic kernel: TPU only
+        out = band_attention(qkv, attn["q_norm"], attn["k_norm"], block["rope_inv_freq"], cfg.num_heads,
+                             cfg.dim_heads, cfg.sub_chunk_size)
+        return _linear(out, attn["to_out"]["weight"])
+    q, k, v, q_diff, k_diff = (_heads(t, cfg) for t in jnp.split(qkv, 5, axis=-1))
     cos, sin = _rope_tables(x.shape[1], block["rope_inv_freq"], dtype)
     q = _rope(_dyt(q, attn["q_norm"]), cos, sin, dtype)
     k = _rope(_dyt(k, attn["k_norm"]), cos, sin, dtype)
