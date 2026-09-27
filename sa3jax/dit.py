@@ -16,17 +16,24 @@ a flag: `medium` sets it and retrofitting it would be an attention rewrite, not 
 from __future__ import annotations
 
 import math
-from typing import Any
+from collections.abc import Callable
+from typing import Any, Final
 
 import jax
 import jax.numpy as jnp
 from jax import Array
 
+from sa3jax import qk_prep
 from sa3jax.config import DiTConfig
 from sa3jax.dtypes import Dtype
 
 Params = dict[str, Any]
 Static = dict[str, Array]
+FlashKernel = Callable[[Array, Array, Array, Array], Array]  # (q, k, v, segment_ids) -> out
+
+# The Pallas TPU flash kernel's legal sequence tiles (multiples of its 128 lanes): self-attention
+# pads 64 + T up to the largest that fits, so the kernel gets as few key blocks as it can.
+_FLASH_TILES: Final[tuple[int, ...]] = (512, 256, 128)
 
 
 def _linear(x: Array, weight: Array, bias: Array | None = None) -> Array:
@@ -109,13 +116,100 @@ def _merge(x: Array) -> Array:
     return x.transpose(0, 2, 1, 3).reshape(batch, seq, heads * dim)
 
 
-def _sdpa(q: Array, k: Array, v: Array, cfg: DiTConfig) -> Array:
+def _flash_padded(length: int) -> int:
+    """`S` padded up to the largest `_FLASH_TILES` tile that fits; the kernel needs a divisor."""
+    tile = next(size for size in _FLASH_TILES if size <= max(length, _FLASH_TILES[-1]))
+    return -(-length // tile) * tile
+
+
+def _pallas_flash(q: Array, k: Array, v: Array, seg: Array) -> Array:
+    """The Pallas TPU flash kernel (`jax.experimental.pallas.ops.tpu.flash_attention`).
+
+    `seg` carries the kernel-padding boundary: real positions `1`, padded `0`. Block tiles must
+    divide the padded length and be multiples of 128; `block_k == kv_seq_len` is legal (the
+    single-step kernel), and head_dim 64 is accepted — the kernel's `l_broadcast` handles
+    `head_dim < 128` by slicing. Imported lazily so a CPU import stays free of the TPU module.
+    """
+    from jax.experimental.pallas.ops.tpu import flash_attention as flash
+
+    tile = next(size for size in _FLASH_TILES if q.shape[2] % size == 0)
+    return flash.flash_attention(
+        q,
+        k,
+        v,
+        segment_ids=flash.SegmentIds(q=seg, kv=seg),
+        causal=False,
+        sm_scale=1.0 / math.sqrt(q.shape[-1]),
+        block_sizes=flash.BlockSizes(block_q=tile, block_k_major=tile, block_k=tile, block_b=1),
+    )
+
+
+def _flash_sdpa(q: Array, k: Array, v: Array, kernel: FlashKernel | None = None) -> Array:
+    """Self-attention via the Pallas TPU flash kernel, padded to a legal tile, sliced back.
+
+    The kernel needs `S % 128 == 0` and cannot express the caller's `v_mask` by segment: a
+    segment-masked key leaves the softmax denominator, while `v_mask` zeroes V and *keeps* the
+    key (`_sdpa`). So only the kernel's own padding past the real length is segment-masked —
+    positions `[0, S)` get id 1, the extra `padded - S` get id 0, and the padded queries' outputs
+    (which attend padded keys only) are sliced away. `v_mask` is applied by `_attend` exactly as
+    in the XLA path. `kernel` is the dependency-injected `(q, k, v, seg) -> out` callable, so the
+    padding/segment/slice logic is testable on CPU with a pure-jnp attention in its place.
+    """
+    length = q.shape[2]
+    padded = _flash_padded(length)
+    seg = jnp.broadcast_to(
+        jnp.concatenate([jnp.ones(length, jnp.int32), jnp.zeros(padded - length, jnp.int32)]),
+        (q.shape[0], padded),
+    )
+    pad = ((0, 0), (0, 0), (0, padded - length), (0, 0))
+    kernel = _pallas_flash if kernel is None else kernel
+    return kernel(jnp.pad(q, pad), jnp.pad(k, pad), jnp.pad(v, pad), seg)[:, :, :length]
+
+
+def _sdpa(q: Array, k: Array, v: Array, cfg: DiTConfig, *, flash: bool = False) -> Array:
     """Unmasked softmax attention at `1/sqrt(head_dim)`. Padding is V-zeroing, not an additive
     mask (`transformer.py:675-699`), so the softmax sees every key; it runs in fp32, as the
-    reference kernels do."""
+    reference kernels do.
+
+    `flash=True` (`cfg.attention == "flash"`, self-attention only) replaces the two einsums with
+    the Pallas TPU kernel. The XLA path rounds the logits to the compute dtype before the fp32
+    softmax; the kernel keeps them fp32 throughout — a deliberate, documented difference.
+    """
+    if flash:
+        return _flash_sdpa(q, k, v)
     logits = jnp.einsum("bhsd,bhtd->bhst", q, k) * (1.0 / math.sqrt(cfg.head_dim))
     weights = jax.nn.softmax(logits.astype(jnp.float32), axis=-1).astype(q.dtype)
     return jnp.einsum("bhst,bhtd->bhsd", weights, v)
+
+
+def _k_norm(attn: Params, k: Array, k_diff: Array | None, cfg: DiTConfig, dtype: Dtype) -> tuple[Array, Array | None]:
+    """`k`'s RMSNorm (and its differential pair), shared by self- and cross-attention. `_attend`
+    only norms `q`, because cross-attention's k is hoisted into `static` already normalised."""
+    k = _rms(k, attn["k_norm"]["weight"], cfg.qk_norm_eps, dtype)
+    if k_diff is not None:
+        k_diff = _rms(k_diff, attn["k_norm"]["weight"], cfg.qk_norm_eps, dtype)
+    return k, k_diff
+
+
+def _attend_out(
+    attn: Params,
+    q: Array,
+    k: Array,
+    v: Array,
+    q_diff: Array | None,
+    k_diff: Array | None,
+    cfg: DiTConfig,
+    *,
+    flash: bool = False,
+) -> Array:
+    """SDPA -> `to_out` (with the differential subtraction) for already normed/roped q/k/v.
+
+    `out = SDPA(q, k, v) - SDPA(q_diff, k_diff, v)` with a shared `v` when `differential`.
+    """
+    out = _sdpa(q, k, v, cfg, flash=flash)
+    if q_diff is not None:
+        out = out - _sdpa(q_diff, k_diff, v, cfg, flash=flash)
+    return _linear(_merge(out), attn["to_out"]["weight"])
 
 
 def _attend(
@@ -129,53 +223,63 @@ def _attend(
     mask: Array | None,
     cfg: DiTConfig,
     dtype: Dtype,
+    *,
+    flash: bool = False,
 ) -> Array:
     """
-    q/k RMSNorm -> RoPE -> SDPA -> `to_out`. `q_diff`/`k_diff` are `None` unless `differential`
-    (`medium`), in which case `out = SDPA(q, k, v) - SDPA(q_diff, k_diff, v)` with a shared `v`.
+    q RMSNorm -> RoPE -> SDPA -> `to_out`. `k`/`k_diff` arrive already k-normed: self-attention
+    norms them inline, cross-attention hoists them into `static`. `q_diff`/`k_diff` are `None`
+    unless `differential` (`medium`), in which case the two SDPAs share `v` and are subtracted.
     """
     q = _rms(q, attn["q_norm"]["weight"], cfg.qk_norm_eps, dtype)
-    k = _rms(k, attn["k_norm"]["weight"], cfg.qk_norm_eps, dtype)
     if q_diff is not None:
         q_diff = _rms(q_diff, attn["q_norm"]["weight"], cfg.qk_norm_eps, dtype)
-        k_diff = _rms(k_diff, attn["k_norm"]["weight"], cfg.qk_norm_eps, dtype)
     if rope is not None:
         q, k = _rope(q, *rope, dtype), _rope(k, *rope, dtype)
         if q_diff is not None:
             q_diff, k_diff = _rope(q_diff, *rope, dtype), _rope(k_diff, *rope, dtype)
     if mask is not None:
         v = v * mask
-    out = _sdpa(q, k, v, cfg)
-    if q_diff is not None:
-        out = out - _sdpa(q_diff, k_diff, v, cfg)
-    return _linear(_merge(out), attn["to_out"]["weight"])
+    return _attend_out(attn, q, k, v, q_diff, k_diff, cfg, flash=flash)
 
 
-def _self_attention(
-    h: Array, block: Params, rope: tuple[Array, Array], mask: Array, cfg: DiTConfig, dtype: Dtype
-) -> Array:
-    """Fused `to_qkv` self-attention, with RoPE and the extended padding mask."""
+def _self_attention(h: Array, block: Params, static: Static, cfg: DiTConfig, dtype: Dtype) -> Array:
+    """Fused `to_qkv` self-attention: the XLA split/norm/RoPE chain, or the fused qk-prep kernel.
+
+    The kernel (`cfg.qk_prep == "pallas"`) applies RMSNorm, RoPE and the V-mask itself and returns
+    `(B, H, 64 + T, D)`, so it lands on `_attend_out`; the XLA path normalises and rotates here and
+    goes through `_attend`.
+    """
     attn = block["self_attn"]
-    parts = jnp.split(_linear(h, attn["to_qkv"]["weight"]), 5 if cfg.differential else 3, axis=-1)
+    qkv = _linear(h, attn["to_qkv"]["weight"])
+    flash = cfg.attention == "flash"
+    if cfg.qk_prep == "pallas":
+        q, k, v, q_diff, k_diff = qk_prep.qk_prep(
+            qkv, attn["q_norm"]["weight"], attn["k_norm"]["weight"], static["qk_cos"], static["qk_sin"],
+            static["v_mask"], cfg.num_heads, cfg.rope_dim // 2, cfg.qk_norm_eps,
+        )
+        return _attend_out(attn, q, k, v, q_diff, k_diff, cfg, flash=flash)
+    parts = jnp.split(qkv, 5 if cfg.differential else 3, axis=-1)
     q, k, v = (_heads(t, cfg) for t in parts[:3])
     q_diff, k_diff = (_heads(t, cfg) for t in parts[3:]) if cfg.differential else (None, None)
-    return _attend(attn, q, k, v, q_diff, k_diff, rope, mask, cfg, dtype)
+    k, k_diff = _k_norm(attn, k, k_diff, cfg, dtype)
+    return _attend(attn, q, k, v, q_diff, k_diff, (static["cos"], static["sin"]), static["v_mask"],
+                   cfg, dtype, flash=flash)
 
 
-def _cross_attention(h: Array, ctx: Array, block: Params, cfg: DiTConfig, dtype: Dtype) -> Array:
-    """`to_q` + `to_kv` cross-attention. No RoPE and no mask (`dit.py:1033-1035`): the reference
-    only forwards `cross_attn_rotary_pos_emb` when it exists, and it is `None` here."""
+def _cross_attention(h: Array, static: Static, block: Params, index: int, cfg: DiTConfig, dtype: Dtype) -> Array:
+    """`to_q` plus the hoisted `to_kv` K/V. No RoPE and no mask (`dit.py:1033-1035`): the
+    reference only forwards `cross_attn_rotary_pos_emb` when it exists, and it is `None` here."""
     attn = block["cross_attn"]
     q = _linear(h, attn["to_q"]["weight"])
-    kv = _linear(ctx, attn["to_kv"]["weight"])
     if cfg.differential:
         q, q_diff = (_heads(t, cfg) for t in jnp.split(q, 2, axis=-1))
-        k, k_diff, v = (_heads(t, cfg) for t in jnp.split(kv, 3, axis=-1))
+        k_diff = static["cross_k_diff"][index]
     else:
-        q = _heads(q, cfg)
-        k, v = (_heads(t, cfg) for t in jnp.split(kv, 2, axis=-1))
-        q_diff = k_diff = None
-    return _attend(attn, q, k, v, q_diff, k_diff, None, None, cfg, dtype)
+        q, q_diff, k_diff = _heads(q, cfg), None, None
+    return _attend(
+        attn, q, static["cross_k"][index], static["cross_v"][index], q_diff, k_diff, None, None, cfg, dtype
+    )
 
 
 def _feed_forward(x: Array, ff: Params) -> Array:
@@ -193,16 +297,14 @@ def _block(h: Array, block: Params, static: Static, gcond: Array, index: int, cf
     scale_self, shift_self, gate_self, scale_ff, shift_ff, gate_ff = jnp.split(
         (block["to_scale_shift_gate"].astype(dtype.compute) + gcond)[:, None, :], 6, axis=-1
     )
-    rope = (static["cos"], static["sin"])
-
     residual = h
     x = _rms(h, block["pre_norm"]["weight"], cfg.norm_eps, dtype)
     x = x * (1 + scale_self) + shift_self
-    x = _self_attention(x, block, rope, static["v_mask"], cfg, dtype)
+    x = _self_attention(x, block, static, cfg, dtype)
     h = residual + x * jax.nn.sigmoid(1 - gate_self)
 
     x = _rms(h, block["cross_attend_norm"]["weight"], cfg.norm_eps, dtype)
-    h = h + _cross_attention(x, static["ctx"], block, cfg, dtype)
+    h = h + _cross_attention(x, static, block, index, cfg, dtype)
 
     # `_apply_local_conditioning` left-pads `(1, T, 1024)` to `64 + T` at the add site
     # (`transformer.py:982`), so the memory tokens receive nothing. See `_local_constants`.
@@ -236,13 +338,27 @@ def _local_constants(blocks: tuple[Params, ...], dtype: Dtype) -> Array:
     )
 
 
+def _cross_kv(block: Params, ctx: Array, cfg: DiTConfig, dtype: Dtype) -> tuple[Array, ...]:
+    """One block's cross-attention K/V: `to_kv` -> split -> heads -> `k_norm`, hoisted out of the
+    sampler loop (`ctx` is constant, so this whole chain ran 24 x 8 times needlessly). Returns
+    `(k, k_diff, v)` when `differential`, `(k, v)` otherwise; `v` is never normed."""
+    attn = block["cross_attn"]
+    kv = _linear(ctx, attn["to_kv"]["weight"])
+    if cfg.differential:
+        k, k_diff, v = (_heads(t, cfg) for t in jnp.split(kv, 3, axis=-1))
+        return (*_k_norm(attn, k, k_diff, cfg, dtype), v)
+    k, v = (_heads(t, cfg) for t in jnp.split(kv, 2, axis=-1))
+    return _k_norm(attn, k, None, cfg, dtype)[0], v
+
+
 def prepare_static(params: Params, cond: Params, padding_mask: Array, cfg: DiTConfig, dtype: Dtype) -> Static:
     """Everything `dit_forward` needs that does not depend on `x` or `t`.
 
     `cond` is `sa3jax.conditioner.assemble_conditioning`'s dict: `cross_attn_cond` `(B, 257, 768)`
     and `global_cond` `(B, 768)`. `cross_attn_mask` is discarded by the reference
     (`dit.py:411-414`) and `local_add_cond` is ignored because it is identically zero here.
-    Per-block cross-attention K/V hoisting is deferred to M8; it changes the block signature.
+    Per-block cross-attention K/V is hoisted here, already k-normed, as a stacked `(depth, ...)`
+    pytree of arrays the sampler reuses every step.
     """
     net = params["transformer"]
     batch, seq_len = padding_mask.shape
@@ -257,14 +373,31 @@ def prepare_static(params: Params, cond: Params, padding_mask: Array, cfg: DiTCo
     # The mask is extended True over the 64 memory tokens (`transformer.py:1213-1225`) and cast to
     # the compute dtype: it multiplies V, it is not an additive attention mask.
     valid = jnp.concatenate([jnp.ones((batch, memory), dtype=bool), padding_mask.astype(bool)], axis=-1)
-    return {
-        "ctx": _sequential(params["to_cond_embed"], cond["cross_attn_cond"].astype(dtype.compute)),
+    ctx = _sequential(params["to_cond_embed"], cond["cross_attn_cond"].astype(dtype.compute))
+    kv = [_cross_kv(block, ctx, cfg, dtype) for block in net["blocks"]]
+    cross: Static = {
+        "cross_k": jnp.stack([t[0] for t in kv]),
+        "cross_v": jnp.stack([t[-1] for t in kv]),
+    }
+    if cfg.differential:
+        cross["cross_k_diff"] = jnp.stack([t[1] for t in kv])
+    static: Static = {
         "gcond_proj": _sequential(params["to_global_embed"], cond["global_cond"].astype(dtype.compute)),
         "local": _local_constants(net["blocks"], dtype),
         "cos": cos,
         "sin": sin,
         "v_mask": valid.astype(dtype.compute)[:, None, :, None],
+        **cross,
     }
+    if cfg.qk_prep == "pallas":
+        # The kernel's padded length and lane-layout tables; `v_mask` is zero-extended with it so
+        # the kernel's pad rows read a real mask (they are sliced off before SDPA either way).
+        if net["rope_inv_freq"].shape[0] * 2 != cfg.rope_dim:
+            raise ValueError(f"qk_prep's rotary width comes from cfg.rope_dim: {net['rope_inv_freq'].shape[0]}")
+        padded = -(-(memory + seq_len) // qk_prep.ROWS) * qk_prep.ROWS
+        static["qk_cos"], static["qk_sin"] = qk_prep.lane_freqs(padded, net["rope_inv_freq"])
+        static["v_mask"] = jnp.pad(static["v_mask"], ((0, 0), (0, 0), (0, padded - (memory + seq_len)), (0, 0)))
+    return static
 
 
 def dit_forward(params: Params, x: Array, t: Array, static: Static, cfg: DiTConfig, dtype: Dtype) -> Array:

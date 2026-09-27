@@ -51,6 +51,13 @@ class DiTConfig:
     qk_norm_eps: float = 1e-6
     rope_theta: float = 10000.0
     fourier_dim: int = 256
+    # Self-attention implementation: the XLA `_sdpa` (any backend) or the fused Pallas TPU flash
+    # kernel (`dit._flash_sdpa`). Cross-attention is always XLA. The flash path pads 64 + T up to
+    # the next legal kernel tile and segment-masks that pad; its logits stay fp32 where XLA rounds.
+    attention: Literal["xla", "flash"] = "xla"
+    # q/k/v prep before SDPA: the XLA split/heads/RMSNorm/RoPE chain, or the fused Pallas TPU
+    # kernel (`qk_prep`), which is independent of `attention`.
+    qk_prep: Literal["xla", "pallas"] = "xla"
 
     @property
     def head_dim(self) -> int:
