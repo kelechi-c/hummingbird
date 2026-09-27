@@ -36,6 +36,7 @@ checkpoint's with `model.encoder.` and `.weight` dropped):
 """
 from __future__ import annotations
 
+import functools
 import pathlib as pl
 
 import jax
@@ -186,9 +187,14 @@ def encode(
     return _rms_norm(x, params["norm"], cfg.t5_rms_eps, dtype)
 
 
+@functools.lru_cache(maxsize=4)
 def load_tokenizer(tokenizer_path: pl.Path, cfg: ConditionerConfig) -> Tokenizer:
     """Rust tokenizer configured to reproduce `AutoTokenizer` with `truncation=True,
-    max_length=cfg.max_length, padding="max_length"` (right padding, pad id 0)."""
+    max_length=cfg.max_length, padding="max_length"` (right padding, pad id 0).
+
+    Cached per `(path, cfg)`: parsing the 4 MB JSON cost 0.6-1.0 s of host time on every request
+    (measured, RTX PRO 6000 host), dwarfing the whole device render. The tokenizer is only read
+    after construction, so sharing one instance is safe."""
     tokenizer = Tokenizer.from_file(str(tokenizer_path))
     tokenizer.enable_truncation(max_length=cfg.max_length)
     tokenizer.enable_padding(direction="right", pad_id=0, pad_token="<pad>", length=cfg.max_length)
