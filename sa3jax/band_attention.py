@@ -106,13 +106,13 @@ def _body(norms, cos_p, sin_p, cos_c, sin_c, cos_n, sin_n, q, qd,
 
 
 def band_attention(qkv: Array, q_norm: dict[str, Array], k_norm: dict[str, Array], inv_freq: Array,
-                   num_heads: int, head_dim: int, window: int, *, rows: int = 128,
+                   num_heads: int, head_dim: int, window: int, *, rows: int = 256,
                    interpret: bool = False) -> Array:
     """`(B, S, 5 * H * D)` projection output -> `(B, S, H * D)` differential band attention.
 
     `q_norm`/`k_norm` are the block's DyT params (`alpha` scalar, `gamma`/`beta` `(D,)`), shared by
     both differential branches as in `same_l._attention`. `rows` is the row tile (a multiple of 8
-    and at least `window`); `S` is zero-padded to a multiple of it and the pad rows are masked.
+    and at least `window`; 256 measured fastest on v6e-1 at 120 s: 64/128/256/512 -> 153/109/88/98 ms); `S` is zero-padded to a multiple of it and the pad rows are masked.
     """
     import jax.experimental.pallas as pl
 
