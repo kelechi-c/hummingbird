@@ -25,14 +25,14 @@ import logging
 import math
 import pathlib as pl
 from functools import partial
-from typing import Final, Literal
+from typing import Callable, Final, Literal
 
 import jax
 import jax.numpy as jnp
 from jax import Array
 
-from sa3jax import conditioner, dit, same, sampling, text_encoder, weights
-from sa3jax.config import ConditionerConfig, ModelConfig, SMALL_MUSIC
+from sa3jax import conditioner, dit, same, same_l, sampling, text_encoder, weights
+from sa3jax.config import ConditionerConfig, ModelConfig, SameConfig, SMALL_MUSIC
 from sa3jax.dtypes import BF16, Dtype
 
 logger = logging.getLogger(__name__)
@@ -112,7 +112,14 @@ def _render(
     """
     schedule = sampling.build_schedule(noise.shape[0], cfg.sigma_max, ANCHOR_LOGSNR, LOGSNR_END)
     latents, _ = sampling.pingpong(dit_params, x0, schedule, noise, static, cfg, dtype, trajectory=False)
-    return latents, same.decode(decoder_params, latents, dither, mask_noise, cfg.decoder, dtype)
+    return latents, decoder_for(cfg.decoder)(decoder_params, latents, dither, mask_noise, cfg.decoder, dtype)
+
+
+def decoder_for(cfg: SameConfig) -> Callable[..., Array]:
+    """SAME-L (`medium`) is the sliding-window 1x1-mapping variant; everything else is SAME-S.
+    Chosen from the config, not the call site: a hardcoded `same.decode` ran SAME-S on SAME-L
+    weights and returned correctly-shaped wrong audio without raising."""
+    return same_l.decode if cfg.sliding_window is not None and not cfg.conv_mapping else same.decode
 
 
 def render(
