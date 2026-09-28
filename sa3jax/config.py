@@ -59,6 +59,11 @@ class DiTConfig:
     # it there is too little work per kernel program to amortise its fixed cost (v6e-1: XLA wins at 184
     # and 452 tokens, fused at 1422). A static shape, so the choice is free at run time.
     fused_min_tokens: int = 1024
+    # int8 W8A8 tier for the big per-token GEMMs: `quant.quantize_params` replaces their weight
+    # leaves with `{"q": int8, "scale": fp32}` and `_linear` dispatches to the int8 path. "bf16" is
+    # the shipped path and is unchanged bit for bit; "int8" is opt-in and lossy (v6e's MXU runs int8
+    # at 2x bf16, the bf16 GEMMs are already at the chip's ceiling). Leaf set: `sa3jax/quant.py`.
+    gemm: Literal["bf16", "int8"] = "bf16"
 
     @property
     def head_dim(self) -> int:
@@ -113,6 +118,9 @@ class SameConfig:
     # TPU kernel (`band_attention`, one HBM pass instead of ~150 ms of window/rope/transpose traffic).
     # "pallas" falls back to XLA off TPU. Needs libtpu matching jax (0.0.23 for jax 0.7.2).
     attention: Literal["xla", "pallas"] = "xla"
+    # int8 W8A8 tier for the decoder's per-block GEMMs; see `DiTConfig.gemm`. Opt-in, lossy, and the
+    # `project_in`/`mapping` head and tail are deliberately outside the tier (once per clip).
+    gemm: Literal["bf16", "int8"] = "bf16"
 
     @property
     def dim(self) -> int:
