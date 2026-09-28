@@ -55,10 +55,11 @@ class DiTConfig:
     # kernel (`dense_attention`: norm -> RoPE -> V-mask -> both differential softmaxes -> subtract in
     # one VMEM pass; scores kept fp32 where XLA rounds them to bf16). "fused" falls back off TPU.
     attention: Literal["xla", "fused"] = "xla"
-    # "fused" only engages at or above this many self-attention tokens (64 memory + T latents): below
-    # it there is too little work per kernel program to amortise its fixed cost (v6e-1: XLA wins at 184
-    # and 452 tokens, fused at 1422). A static shape, so the choice is free at run time.
-    fused_min_tokens: int = 1024
+    # "fused" only engages at or above this many self-attention tokens (64 memory + T latents). v6e-1,
+    # DiT ms XLA/fused: 452 tok 32.3/40.6, 645 45.5/54.1, 838 61.2/72.4, 1162 83.3/99.4, 1422 152.7/133.5.
+    # The kernel wins only past XLA's cliff (1162 -> 1422 tokens costs XLA 1.83x), so the threshold sits
+    # just below 120 s. A static shape, so the choice is free at run time.
+    fused_min_tokens: int = 1400
     # int8 W8A8 tier for the big per-token GEMMs: `quant.quantize_params` replaces their weight
     # leaves with `{"q": int8, "scale": fp32}` and `_linear` dispatches to the int8 path. "bf16" is
     # the shipped path and is unchanged bit for bit; "int8" is opt-in and lossy (v6e's MXU runs int8
