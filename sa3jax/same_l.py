@@ -39,7 +39,6 @@ import jax
 import jax.numpy as jnp
 from jax import Array
 
-from sa3jax import quant
 from sa3jax.band_attention import band_attention
 from sa3jax.config import SameConfig
 from sa3jax.dtypes import Dtype
@@ -50,11 +49,8 @@ _AUDIO_CHANNELS = 2  # `patched` pretransform `channels: 2`; patch_size = 512 //
 _DITHER_SCALE = 1e-3  # `SoftNormBottleneck.decode`'s eval-path `scale`
 
 
-def _linear(x: Array, weight: Array | quant.QuantLeaf, bias: Array | None = None) -> Array:
-    """`nn.Linear`; the checkpoint stores `[out, in]`. A `quant.QuantLeaf` weight (the int8 tier)
-    dispatches to the W8A8 path; every other leaf is the plain matmul, unchanged."""
-    if quant.is_quant(weight):
-        return quant.linear_int8(x, weight, bias)
+def _linear(x: Array, weight: Array, bias: Array | None = None) -> Array:
+    """`nn.Linear`; the checkpoint stores `[out, in]`."""
     y = x @ jnp.swapaxes(weight, -1, -2)
     return y if bias is None else y + bias
 

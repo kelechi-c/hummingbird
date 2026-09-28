@@ -23,18 +23,15 @@ import jax
 import jax.numpy as jnp
 from jax import Array
 
-from sa3jax import dense_attention, quant
+from sa3jax import dense_attention
 from sa3jax.config import DiTConfig
 from sa3jax.dtypes import Dtype
 
 Params = dict[str, Any]
 Static = dict[str, Array]
 
-def _linear(x: Array, weight: Array | quant.QuantLeaf, bias: Array | None = None) -> Array:
-    """`nn.Linear`; the checkpoint stores `[out, in]`. A `quant.QuantLeaf` weight (the int8 tier)
-    dispatches to the W8A8 path; every other leaf is the plain matmul, unchanged."""
-    if quant.is_quant(weight):
-        return quant.linear_int8(x, weight, bias)
+def _linear(x: Array, weight: Array, bias: Array | None = None) -> Array:
+    """`nn.Linear`; the checkpoint stores `[out, in]`."""
     y = x @ jnp.swapaxes(weight, -1, -2)
     return y if bias is None else y + bias
 
