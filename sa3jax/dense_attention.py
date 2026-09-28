@@ -34,13 +34,24 @@ from jax import Array, lax
 from sa3jax.band_attention import LANES, rope_tables
 
 FAST_ROWS = 256
+# One whole-sequence query block wins only near 120 s (v6e-1, DiT ms at 1422 tokens: 256-row 105.1, 712-row 100.7,
+# one block 99.0); at 1162 tokens 256-row wins (82.7 vs 87.8 at 712), and past ~1536 the fp32 scores outgrow VMEM.
+SINGLE_BLOCK = (1400, 1536)
+VMEM_LIMIT = 100 * 2**20  # v6e has 128 MiB of VMEM; the default scoped limit is far lower
 
 
-def _body(norms, cos_q, sin_q, cos_k, sin_k, v_mask, q, qd, k, v, kd, out, *, head_dim, half, eps, compute):
-    """One `(rows, 128)` output tile: query block `i` of head pair `h`, both differential branches."""
+def _body(norms, cos_q, sin_q, cos_k, sin_k, v_mask, q, qd, k, v, kd, out, k_s, kd_s, v_s, *, head_dim, half,
+          eps, compute, stack):
+    """One `(rows, 128)` output tile: query block `i` of head pair `h`, both differential branches.
+
+    K, K_diff and masked V do not depend on the query block, so they are prepared once per head pair
+    (at `i == 0`) into VMEM scratch and reused by the pair's other query blocks. Recomputing them per
+    block was about as much vector work as the scores themselves.
+    """
+    from jax.experimental import pallas as pl
     from jax.experimental.pallas import tpu as pltpu
 
-    f32 = jnp.float32
+    f32, bf16 = jnp.float32, jnp.bfloat16
     lane = lax.broadcasted_iota(jnp.int32, (1, LANES), 1)
     head_a = lane < head_dim
     rot_low = lane % head_dim < half
@@ -58,49 +69,57 @@ def _body(norms, cos_q, sin_q, cos_k, sin_k, v_mask, q, qd, k, v, kd, out, *, he
         return (x * cos[...] + partner * sin[...]).astype(compute)
 
     q_weight, k_weight = norms[0:1, :], norms[1:2, :]
-    values = (v[0] * v_mask[0]).astype(jnp.bfloat16)
 
-    def branch(q_ref, k_ref):
-        # the 1/sqrt(64) = 2^-3 scale folded into q: exact in bf16, and one full-score-matrix
-        # multiply fewer — the kernel is bound by vector ops on the (rows, L) scores, not the MXU
-        qf = (prep(q_ref, q_weight, cos_q, sin_q).astype(f32) * scale).astype(jnp.bfloat16)
-        kf = prep(k_ref, k_weight, cos_k, sin_k).astype(jnp.bfloat16)
-        heads = []
-        for lanes in (head_a, ~head_a):
-            logits = lax.dot_general(jnp.where(lanes, qf, jnp.zeros_like(qf)), kf, nt, preferred_element_type=f32)
-            weights = jnp.exp(logits - logits.max(-1, keepdims=True))
-            # normalise after P @ V: the division runs on (rows, 128), not on (rows, L)
-            total = weights.sum(-1, keepdims=True)
-            heads.append(jnp.dot(weights.astype(jnp.bfloat16), values, preferred_element_type=f32) / total)
-        return jnp.where(head_a, heads[0], heads[1])
+    @pl.when(pl.program_id(2) == 0)
+    def _():
+        k_s[...] = prep(k, k_weight, cos_k, sin_k).astype(bf16)
+        kd_s[...] = prep(kd, k_weight, cos_k, sin_k).astype(bf16)
+        v_s[...] = (v[0] * v_mask[0]).astype(bf16)
 
-    out[0] = (branch(q, k) - branch(qd, kd)).astype(compute)
+    def attend(queries, keys):
+        """softmax(queries @ keys^T) @ V, normalised after P @ V (on 128 lanes, not on L)."""
+        logits = lax.dot_general(queries, keys, nt, preferred_element_type=f32)
+        weights = jnp.exp(logits - logits.max(-1, keepdims=True))
+        return jnp.dot(weights.astype(bf16), v_s[...], preferred_element_type=f32) / weights.sum(-1, keepdims=True)
+
+    def branch(q_ref, keys):
+        # the 1/sqrt(64) = 2^-3 scale folded into q: exact, and one full-score-matrix multiply fewer
+        qf = prep(q_ref, q_weight, cos_q, sin_q).astype(f32) * scale
+        own, other = jnp.where(head_a, qf, 0.0), jnp.where(head_a, 0.0, qf)
+        if stack:  # both heads as one (2 rows, 128) operand: one matmul and one softmax, half the ops
+            both = attend(jnp.concatenate([own, other]).astype(bf16), keys)
+            return jnp.where(head_a, both[: qf.shape[0]], both[qf.shape[0]:])
+        return jnp.where(head_a, attend(own.astype(bf16), keys), attend(other.astype(bf16), keys))
+
+    out[0] = (branch(q, k_s[...]) - branch(qd, kd_s[...])).astype(compute)
 
 
-def tables(length: int, inv_freq: Array, valid: Array, head_dim: int, compute: jnp.dtype,
-           rows: int = FAST_ROWS) -> tuple[Array, Array, Array]:
-    """Per-clip inputs: lane RoPE cos / signed-sin `(blocks * rows, 128)` fp32 and the lane V-mask
-    `(B, L, 128)` in the compute dtype. Built once in `dit.prepare_static`, reused by all 192 calls."""
-    cos, sin = rope_tables(-(-length // rows) * rows, inv_freq, head_dim)
+def tables(length: int, inv_freq: Array, valid: Array, head_dim: int, compute: jnp.dtype) -> tuple[Array, Array, Array]:
+    """Per-clip inputs: lane RoPE cos / signed-sin `(L, 128)` fp32 and the lane V-mask `(B, L, 128)` in the
+    compute dtype. Built once in `dit.prepare_static`, reused by all 192 calls."""
+    cos, sin = rope_tables(length, inv_freq, head_dim)
     return cos, sin, jnp.broadcast_to(valid.astype(compute)[:, :, None], (*valid.shape, LANES))
 
 
 def dense_attention(qkv: Array, q_weight: Array, k_weight: Array, cos: Array, sin: Array, mask: Array,
-                    num_heads: int, head_dim: int, half: int, eps: float, *, rows: int = FAST_ROWS,
-                    interpret: bool = False) -> Array:
+                    num_heads: int, head_dim: int, half: int, eps: float, *, rows: int | None = None,
+                    stack: bool = True, interpret: bool = False) -> Array:
     """`(B, L, 5 * H * D)` DiT `to_qkv` output -> `(B, L, H * D)` differential self-attention.
 
-    `q_weight`/`k_weight` are the q/k RMSNorm scales `(D,)`; `cos`/`sin`/`mask` come from `tables`
-    (built with the same `rows`); `half` is the rotate-half width (16 for a 32-dim rotary).
+    `q_weight`/`k_weight` are the q/k RMSNorm scales `(D,)`; `cos`/`sin`/`mask` come from `tables`;
+    `half` is the rotate-half width (16 for a 32-dim rotary). `rows` is the query block (a multiple of
+    8; default: one block near 120 s, else 256 — see `SINGLE_BLOCK`); the last block may be ragged — its
+    out-of-range rows read undefined data, are row-independent through the softmax, and are dropped on
+    write. `stack` (default on, measured faster) runs both heads of a tile as one operand.
     """
     import jax.experimental.pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
 
-    if head_dim * 2 != LANES or rows % 8 or cos.shape[0] % rows:
-        raise ValueError(f"dense_attention needs head_dim 64, rows % 8 == 0 and tables built with rows "
-                         f"(head_dim={head_dim}, rows={rows}, table rows={cos.shape[0]})")
+    rows = rows or (-(-qkv.shape[1] // 8) * 8 if SINGLE_BLOCK[0] <= qkv.shape[1] <= SINGLE_BLOCK[1] else FAST_ROWS)
+    if head_dim * 2 != LANES or rows % 8:
+        raise ValueError(f"dense_attention needs head_dim 64 and rows % 8 == 0 (head_dim={head_dim}, rows={rows})")
     batch, length, _ = qkv.shape
     pairs = num_heads * head_dim // LANES
-    blocks = -(-length // rows)
     lanes = lambda w: jnp.tile(w.astype(jnp.float32), LANES // w.shape[0])[None]  # noqa: E731
     norms = jnp.concatenate([lanes(q_weight), lanes(k_weight), jnp.zeros((6, LANES), jnp.float32)])
 
@@ -119,12 +138,16 @@ def dense_attention(qkv: Array, q_weight: Array, k_weight: Array, cos: Array, si
         column(1, length, whole), column(2, length, whole), column(4, length, whole),
     ]
     kernel = pl.pallas_call(
-        partial(_body, head_dim=head_dim, half=half, eps=eps, compute=qkv.dtype),
+        partial(_body, head_dim=head_dim, half=half, eps=eps, compute=qkv.dtype, stack=stack),
         out_shape=jax.ShapeDtypeStruct((batch, length, pairs * LANES), qkv.dtype),
-        grid=(batch, pairs, blocks),
+        grid=(batch, pairs, -(-length // rows)),
         in_specs=in_specs,
         out_specs=pl.BlockSpec((1, rows, LANES), lambda b, h, i: (b, i, h)),
+        scratch_shapes=[pltpu.VMEM((length, LANES), jnp.bfloat16)] * 3,
+        # the query-block axis must run in order on one core: block 0 fills the K/V scratch the rest read
+        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel", "parallel", "arbitrary"),
+                                             vmem_limit_bytes=VMEM_LIMIT),
         interpret=interpret,
         name="dit_dense_attention",
     )
-    return kernel(norms, cos, sin, cos[:length], sin[:length], mask, *[qkv] * 5)
+    return kernel(norms, cos, sin, cos, sin, mask, *[qkv] * 5)

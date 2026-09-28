@@ -60,7 +60,7 @@ def rope_tables(length: int, inv_freq: Array, head_dim: int) -> tuple[Array, Arr
 
 def _body(norms, cos_p, sin_p, cos_c, sin_c, cos_n, sin_n, q, qd,
           k_p, k_c, k_n, v_p, v_c, v_n, kd_p, kd_c, kd_n, out, *, rows, halo, sub, length, window, head_dim,
-          half, compute):
+          half, compute, stack):
     """One `(rows, 128)` output tile: row block `i`, head pair `h`, both differential branches.
 
     Keys are the contiguous `rows + 2 * halo` positions `i * rows - halo + r`: a halo before, the
@@ -93,6 +93,13 @@ def _body(norms, cos_p, sin_p, cos_c, sin_c, cos_n, sin_n, q, qd,
     # because a masked weight of 0 times a NaN would still be NaN
     v = jnp.where((k_row >= 0) & (k_row < length), jnp.concatenate([r[0] for r in (v_p, v_c, v_n)]), 0).astype(bf16)
 
+    def attend(queries, keys, values, band):
+        """Band-masked softmax(queries @ keys^T) @ values, normalised after P @ V (on 128 lanes)."""
+        logits = lax.dot_general(queries, keys, nt, preferred_element_type=f32)
+        logits = jnp.where(band, logits, _NEG)  # the max must see only in-band (and finite) scores
+        weights = jnp.exp(logits - logits.max(-1, keepdims=True))
+        return jnp.dot(weights.astype(bf16), values, preferred_element_type=f32) / weights.sum(-1, keepdims=True)
+
     def branch(q_ref, k_refs):
         qf = prep(q_ref, q_norm, cos_c, sin_c, scale)  # 1/sqrt(64) = 2^-3 folded into q: exact in bf16
         kf = jnp.concatenate([prep(ref, k_norm, *tables[j]) for j, ref in enumerate(k_refs)])
@@ -102,15 +109,12 @@ def _body(norms, cos_p, sin_p, cos_c, sin_c, cos_n, sin_n, q, qd,
             k_pos = k_start + s * sub + lax.broadcasted_iota(jnp.int32, (1, span), 1)
             band = (jnp.abs(k_pos - q_pos) <= window) & (k_pos >= 0) & (k_pos < length)
             qs, ks, vs = qf[s * sub:(s + 1) * sub], kf[s * sub:s * sub + span], v[s * sub:s * sub + span]
-            heads = []
-            for lanes in (head_a, ~head_a):
-                logits = lax.dot_general(jnp.where(lanes, qs, jnp.zeros_like(qs)), ks, nt, preferred_element_type=f32)
-                logits = jnp.where(band, logits, _NEG)  # the max must see only in-band (and finite) scores
-                weights = jnp.exp(logits - logits.max(-1, keepdims=True))
-                # normalise after P @ V: the division runs on (sub, 128), not on (sub, span)
-                total = weights.sum(-1, keepdims=True)
-                heads.append(jnp.dot(weights.astype(bf16), vs, preferred_element_type=f32) / total)
-            slices.append(jnp.where(head_a, heads[0], heads[1]))
+            own, other = jnp.where(head_a, qs, jnp.zeros_like(qs)), jnp.where(head_a, jnp.zeros_like(qs), qs)
+            if stack:  # both heads as one (2 sub, 128) operand: one matmul and one softmax, half the ops
+                both = attend(jnp.concatenate([own, other]), ks, vs, jnp.concatenate([band, band]))
+                slices.append(jnp.where(head_a, both[:sub], both[sub:]))
+            else:
+                slices.append(jnp.where(head_a, attend(own, ks, vs, band), attend(other, ks, vs, band)))
         return jnp.concatenate(slices)
 
     out[0] = (branch(q, (k_p, k_c, k_n)) - branch(qd, (kd_p, kd_c, kd_n))).astype(compute)
@@ -118,7 +122,7 @@ def _body(norms, cos_p, sin_p, cos_c, sin_c, cos_n, sin_n, q, qd,
 
 def band_attention(qkv: Array, q_norm: dict[str, Array], k_norm: dict[str, Array], inv_freq: Array,
                    num_heads: int, head_dim: int, window: int, *, rows: int = 1024, halo: int = 32,
-                   sub: int = 256, interpret: bool = False) -> Array:
+                   sub: int = 256, stack: bool = True, interpret: bool = False) -> Array:
     """`(B, S, 5 * H * D)` projection output -> `(B, S, H * D)` differential band attention.
 
     `q_norm`/`k_norm` are the block's DyT params (`alpha` scalar, `gamma`/`beta` `(D,)`), shared by
@@ -165,7 +169,7 @@ def band_attention(qkv: Array, q_norm: dict[str, Array], k_norm: dict[str, Array
     in_specs += [spec for offset in (1, 2, 4) for spec in keys(offset)]
     kernel = pl.pallas_call(
         partial(_body, rows=rows, halo=halo, sub=sub, length=length, window=window, head_dim=head_dim,
-                half=inv_freq.shape[0], compute=qkv.dtype),
+                half=inv_freq.shape[0], compute=qkv.dtype, stack=stack),
         out_shape=jax.ShapeDtypeStruct((batch, length, pairs * LANES), qkv.dtype),
         grid=(batch, blocks, pairs),
         in_specs=in_specs,

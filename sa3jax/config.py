@@ -55,11 +55,10 @@ class DiTConfig:
     # kernel (`dense_attention`: norm -> RoPE -> V-mask -> both differential softmaxes -> subtract in
     # one VMEM pass; scores kept fp32 where XLA rounds them to bf16). "fused" falls back off TPU.
     attention: Literal["xla", "fused"] = "xla"
-    # "fused" only engages at or above this many self-attention tokens (64 memory + T latents). v6e-1,
-    # DiT ms XLA/fused: 452 tok 32.3/40.6, 645 45.5/54.1, 838 61.2/72.4, 1162 83.3/99.4, 1422 152.7/133.5.
-    # The kernel wins only past XLA's cliff (1162 -> 1422 tokens costs XLA 1.83x), so the threshold sits
-    # just below 120 s. A static shape, so the choice is free at run time.
-    fused_min_tokens: int = 1400
+    # "fused" only engages at or above this many self-attention tokens (64 memory + T latents). v6e-1, DiT ms
+    # XLA/fused after the K-prep cache: 838 tok 61.0/59.3, 1162 83.3/82.7, 1422 153.2/99.0 (before it the
+    # kernel lost below 1422). Below 838 is unmeasured for the new kernel, so XLA keeps it. Static shape: free.
+    fused_min_tokens: int = 800
 
     @property
     def head_dim(self) -> int:
