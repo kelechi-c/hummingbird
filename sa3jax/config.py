@@ -55,6 +55,10 @@ class DiTConfig:
     # kernel (`dense_attention`: norm -> RoPE -> V-mask -> both differential softmaxes -> subtract in
     # one VMEM pass; scores kept fp32 where XLA rounds them to bf16). "fused" falls back off TPU.
     attention: Literal["xla", "fused"] = "xla"
+    # "fused" only engages at or above this many self-attention tokens (64 memory + T latents): below
+    # it there is too little work per kernel program to amortise its fixed cost (v6e-1: XLA wins at 184
+    # and 452 tokens, fused at 1422). A static shape, so the choice is free at run time.
+    fused_min_tokens: int = 1024
 
     @property
     def head_dim(self) -> int:
@@ -165,7 +169,8 @@ SMALL_MUSIC = ModelConfig()
 # SAME-L / `medium`. Only the DiT and the decoder differ; the conditioner is byte-identical
 # (verified: same sha256 for the bundled t5gemma-b-b-ul2 weights in both checkpoints).
 MEDIUM = ModelConfig(
-    dit=DiTConfig(embed_dim=1536, depth=24, num_heads=24, differential=True),
+    dit=DiTConfig(embed_dim=1536, depth=24, num_heads=24, differential=True,
+                  attention="fused"),  # D4: gate pass, closer to the reference than XLA (fp32 scores)
     decoder=SameConfig(
         channels=256,
         transformer_depth=12,

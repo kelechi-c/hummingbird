@@ -117,14 +117,17 @@ def _body(norms, cos_p, sin_p, cos_c, sin_c, cos_n, sin_n, q, qd,
 
 
 def band_attention(qkv: Array, q_norm: dict[str, Array], k_norm: dict[str, Array], inv_freq: Array,
-                   num_heads: int, head_dim: int, window: int, *, rows: int = 256, halo: int = 32,
-                   sub: int = 128, interpret: bool = False) -> Array:
+                   num_heads: int, head_dim: int, window: int, *, rows: int = 1024, halo: int = 32,
+                   sub: int = 256, interpret: bool = False) -> Array:
     """`(B, S, 5 * H * D)` projection output -> `(B, S, H * D)` differential band attention.
 
     `q_norm`/`k_norm` are the block's DyT params (`alpha` scalar, `gamma`/`beta` `(D,)`), shared by
     both differential branches as in `same_l._attention`. `rows` is the row tile; `halo` (>= window,
     a multiple of 8 dividing `rows`) the neighbour rows each side; `sub` the query slice (dividing
     `rows`). `S` need not divide `rows`: the grid is ragged and out-of-range rows are masked/dropped.
+    Defaults are the v6e-1 optimum at 120 s (decode only: 256x64 120.1, 256x128 84.8, 256x256 73.8,
+    512x256 63.3, 1024x256 60.3, 512x512 66.9 ms): larger slices win until 256 because the kernel is
+    bound by per-op vector work, not FLOPs; taller row blocks read each K halo for more queries.
     """
     import jax.experimental.pallas as pl
 

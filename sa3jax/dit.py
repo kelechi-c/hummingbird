@@ -176,13 +176,19 @@ def _attend(
     return _attend_out(attn, q, k, v, q_diff, k_diff, cfg)
 
 
+def _fused(cfg: DiTConfig, tokens: int) -> bool:
+    """Whether self-attention takes the fused TPU kernel at this (static) sequence length."""
+    return (cfg.attention == "fused" and cfg.differential and tokens >= cfg.fused_min_tokens
+            and jax.default_backend() == "tpu")
+
+
 def _self_attention(h: Array, block: Params, static: Static, cfg: DiTConfig, dtype: Dtype) -> Array:
     """Fused `to_qkv` self-attention: the XLA split/norm/RoPE/SDPA chain, or on TPU the fused Pallas
     kernel (`cfg.attention == "fused"`, `dense_attention`), which does norm -> RoPE -> V-mask ->
     both differential softmaxes -> subtract in one VMEM pass and writes the merged layout."""
     attn = block["self_attn"]
     qkv = _linear(h, attn["to_qkv"]["weight"])
-    if cfg.attention == "fused" and cfg.differential and jax.default_backend() == "tpu":
+    if _fused(cfg, h.shape[1]):
         out = dense_attention.dense_attention(qkv, attn["q_norm"]["weight"], attn["k_norm"]["weight"],
                                               static["lane_cos"], static["lane_sin"], static["lane_mask"],
                                               cfg.num_heads, cfg.head_dim, cfg.rope_dim // 2, cfg.qk_norm_eps)
@@ -325,7 +331,7 @@ def _static(params: Params, cross_cond: Array, global_cond: Array, padding_mask:
     }
     if cfg.differential:
         static["cross_k_diff"] = jnp.stack([t[1] for t in kv])
-    if cfg.attention == "fused":
+    if cfg.attention == "fused" and memory + seq_len >= cfg.fused_min_tokens:
         static["lane_cos"], static["lane_sin"], static["lane_mask"] = dense_attention.tables(
             memory + seq_len, net["rope_inv_freq"], valid, cfg.head_dim, dtype.compute)
     return static
